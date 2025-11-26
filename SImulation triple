@@ -203,6 +203,51 @@ def run_hyper_trial(n_patients=1000): # Reduced N for complexity
         })
         
     return pd.DataFrame(results)
+
+
+def evaluate_hyper_results(df):
+    """Return simple accuracy diagnostics for the stochastic trial surrogate.
+
+    The function compares arm-level median PFS to the calibration targets used
+    in the simplified clinical trial engine. Differences between the simulated
+    and target medians provide a quick accuracy readout without requiring heavy
+    external validation datasets. Additional distributional diagnostics can be
+    appended here as the model evolves.
+    """
+
+    targets = {
+        'Chemo': 105,
+        'Dual': 165,
+        'Triple': 270,
+    }
+
+    rows = []
+    for arm, target in targets.items():
+        subset = df[df['arm'] == arm]
+        median_pfs = subset['pfs'].median()
+        diff = median_pfs - target
+        rows.append({
+            'arm': arm,
+            'target_median_days': target,
+            'simulated_median_days': median_pfs,
+            'median_error_days': diff,
+            'median_error_pct': 100 * diff / target,
+        })
+
+    summary = pd.DataFrame(rows)
+    summary['patients_per_arm'] = summary['arm'].map(
+        df.groupby('arm').size().to_dict()
+    )
+
+    # Quick distributional sanity checks for reporting
+    summary['pfs_iqr_days'] = summary['arm'].map(
+        df.groupby('arm')['pfs'].quantile(0.75).sub(
+            df.groupby('arm')['pfs'].quantile(0.25)
+        ).to_dict()
+    )
+    return summary[['arm', 'patients_per_arm', 'target_median_days',
+                    'simulated_median_days', 'median_error_days',
+                    'median_error_pct', 'pfs_iqr_days']]
 # ==========================================
 # 4. Visualization
 # ==========================================
@@ -231,9 +276,14 @@ def plot_hyper_results(df):
     plt.xlabel("Stroma Density (Diffusion Barrier)")
     plt.ylabel("Best Tumor Response (%)")
     plt.savefig('figures/fig_spatial_validation.png')
+
 if __name__ == "__main__":
     import os
+
     os.makedirs('figures', exist_ok=True)
     df = run_hyper_trial(3000)
+    eval_summary = evaluate_hyper_results(df)
+    print("\nCalibration diagnostics (simulated vs. target medians):")
+    print(eval_summary.to_string(index=False))
     plot_hyper_results(df)
     print("Hyper-Realistic Simulation Complete.")
