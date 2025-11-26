@@ -6,6 +6,7 @@ from scipy.integrate import solve_ivp
 from scipy.stats import norm, lognorm, beta
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
+from lifelines import KaplanMeierFitter
 # ==========================================
 # 0. Global Configuration & Style
 # ==========================================
@@ -70,80 +71,156 @@ class PhysiologyGenerator:
 # ==========================================
 # 2. Hyper-Realistic Spatial Model
 # ==========================================
+# ==========================================
+# 2. Hyper-Realistic Spatial Model (ODE)
+# ==========================================
+# ==========================================
+# 2. Hyper-Realistic Spatial Model (ODE)
+# ==========================================
 class SpatialModel:
     def __init__(self, patient):
         self.p = patient
-        # State Vector Map (Size 60)
-        # 0-14: Drug 1 (PBPK + Tumor Layers)
-        # ... Drug 2, Drug 3
-        # 45: Clone A (Margin)
-        # 46: Clone A (Core)
-        # 47: Clone B (Margin)
-        # 48: Clone B (Core)
-        # 49: Clone C (Margin)
-        # 50: Clone C (Core)
-        # 51: T-Cells (Margin)
-        # 52: T-Cells (Core)
+        # State Vector Map (Size 20)
+        # 0-3: Drug 1 (Chemo) [Central, Stroma, Margin, Core]
+        # 4-7: Drug 2 (Targeted)
+        # 8-11: Drug 3 (IO - Antibody)
+        # 12-13: Clone A (Sensitive) [Margin, Core]
+        # 14-15: Clone B (Resistant) [Margin, Core]
+        # 16-17: Clone C (Evolved) [Margin, Core]
+        # 18-19: T-Cells [Margin, Core]
         
-    def derivatives(self, t, y, dose_rate):
+    def get_initial_conditions(self):
+        y0 = np.zeros(20)
+        # Initial Tumor Burden (normalized to 1.0 total)
+        # Distributed between Margin (70%) and Core (30%)
+        total_vol = 1.0
+        
+        # Clonal fractions
+        f_A = self.p['clones']['A']
+        f_B = self.p['clones']['B']
+        f_C = self.p['clones']['C']
+        
+        # Margin (better vascularized, more cells)
+        y0[12] = total_vol * 0.7 * f_A # A Margin
+        y0[14] = total_vol * 0.7 * f_B # B Margin
+        y0[16] = total_vol * 0.7 * f_C # C Margin
+        
+        # Core (hypoxic, fewer cells)
+        y0[13] = total_vol * 0.3 * f_A # A Core
+        y0[15] = total_vol * 0.3 * f_B # B Core
+        y0[17] = total_vol * 0.3 * f_C # C Core
+        
+        # T-Cells (Baseline infiltration)
+        # Higher in "Hot" tumors (Melanoma)
+        base_T = 0.1 if self.p['cancer_type'] == 'Melanoma' else 0.01
+        y0[18] = base_T # Margin
+        y0[19] = base_T * 0.5 # Core (harder to infiltrate)
+        
+        return y0
+
+    def derivatives(self, t, y, arm):
         dydt = np.zeros_like(y)
         
-        # --- PBPK & Spatial Diffusion ---
-        # Simplified for speed: Central -> Stroma -> Margin -> Core
-        # Drug 1
-        C_cent = y[0]
-        C_stroma = y[1]
-        C_margin = y[2]
-        C_core = y[3]
+        # --- 1. Pharmacokinetics (Spatial) ---
+        # Chemo/IO: Bolus (handled in loop), so dose_rate = 0 here
+        # Targeted: Daily -> Constant infusion approximation
         
-        # Diffusion Constants (affected by Stroma)
-        k_diff = 0.5 * (1 - self.p['stroma']) # High stroma = Low diffusion
+        dose_chemo = 0
+        dose_targ = 0
+        dose_io = 0
         
-        dydt[0] = dose_rate[0] - 1.0*C_cent - k_diff*(C_cent - C_stroma) # Central
-        dydt[1] = k_diff*(C_cent - C_stroma) - k_diff*(C_stroma - C_margin) # Stroma
-        dydt[2] = k_diff*(C_stroma - C_margin) - k_diff*(C_margin - C_core) # Margin
-        dydt[3] = k_diff*(C_margin - C_core) - 0.1*C_core # Core (sink)
+        if arm in ['Dual', 'Triple']:
+            dose_targ = 5.0 # Daily constant
+            
+        # --- Drug 1: Chemo (Small Molecule, High Diff) ---
+        k_diff_1 = 2.0 * (1 - self.p['stroma']) 
+        k_elim_1 = 0.5 # Slower elimination (Half-life ~1.4 days)
         
-        # Repeat for Drugs 2, 3 (Indices 15.., 30..)
-        # ... (Simplified: assume similar kinetics for demo)
+        dydt[0] = dose_chemo - k_elim_1*y[0] - k_diff_1*(y[0] - y[1])
+        dydt[1] = k_diff_1*(y[0] - y[1]) - k_diff_1*(y[1] - y[2])
+        dydt[2] = k_diff_1*(y[1] - y[2]) - k_diff_1*(y[2] - y[3])
+        dydt[3] = k_diff_1*(y[2] - y[3]) - 0.1*y[3] 
         
-        # --- Clonal Dynamics ---
-        # Growth Rates
-        r_A = 0.02 # Fast
-        r_B = 0.015 # Cost of resistance
-        r_C = 0.025 # Super-clone
+        # --- Drug 2: Targeted (Small Molecule, Med Diff) ---
+        k_diff_2 = 1.5 * (1 - self.p['stroma'])
+        k_elim_2 = 1.0
         
-        # Kill Rates (Drug 1+2)
-        # Margin has high drug, Core has low drug
-        kill_A_margin = 1.0 * C_margin
-        kill_A_core = 1.0 * C_core # Lower conc
+        dydt[4] = dose_targ - k_elim_2*y[4] - k_diff_2*(y[4] - y[5])
+        dydt[5] = k_diff_2*(y[4] - y[5]) - k_diff_2*(y[5] - y[6])
+        dydt[6] = k_diff_2*(y[5] - y[6]) - k_diff_2*(y[6] - y[7])
+        dydt[7] = k_diff_2*(y[6] - y[7]) - 0.1*y[7]
         
-        kill_B = 0.01 * C_margin # Resistant
+        # --- Drug 3: IO (Antibody, Low Diff, High Binding) ---
+        k_diff_3 = 0.2 * (1 - self.p['stroma']) 
+        k_elim_3 = 0.1 
         
-        # Clone A
-        dydt[45] = r_A*y[45] - kill_A_margin*y[45] # Margin
-        dydt[46] = 0.5*r_A*y[46] - kill_A_core*y[46] # Core (hypoxic growth slower)
+        dydt[8] = dose_io - k_elim_3*y[8] - k_diff_3*(y[8] - y[9])
+        dydt[9] = k_diff_3*(y[8] - y[9]) - k_diff_3*(y[9] - y[10])
+        dydt[10] = k_diff_3*(y[9] - y[10]) - k_diff_3*(y[10] - y[11])
+        dydt[11] = k_diff_3*(y[10] - y[11]) - 0.05*y[11]
+
+        # --- 2. Tumor Dynamics ---
+        C_chemo_m, C_chemo_c = y[2], y[3]
+        C_targ_m, C_targ_c = y[6], y[7]
+        C_io_m, C_io_c = y[10], y[11]
         
-        # Clone B
-        dydt[47] = r_B*y[47] - kill_B*y[47]
-        dydt[48] = 0.5*r_B*y[48] - kill_B*y[48]
+        # Growth Rates (Calibrated: 0.01 ~ 70 day doubling)
+        r_A = 0.01 
+        r_B = 0.02 # Aggressive resistant growth
+        r_C = 0.025 
         
-        # Mutation (A -> C) under stress
-        mut_rate = 1e-5 * kill_A_margin * y[45]
-        dydt[49] = r_C*y[49] + mut_rate # Clone C emerges
+        # Killing Functions
+        # Chemo: Needs to be potent but not curative
+        kill_chemo_m = 2.0 * C_chemo_m / (5 + C_chemo_m)
+        kill_chemo_c = 2.0 * C_chemo_c / (5 + C_chemo_c)
+        
+        # Targeted
+        kill_targ_m = 1.0 * C_targ_m / (2 + C_targ_m)
+        kill_targ_c = 1.0 * C_targ_c / (2 + C_targ_c)
+        
+        # IO
+        T_cells_m, T_cells_c = y[18], y[19]
+        kill_T_m = 1.5 * T_cells_m
+        kill_T_c = 1.5 * T_cells_c
+        
+        # --- Equations ---
+        
+        # Clone A (Sensitive)
+        dydt[12] = r_A*y[12] - (kill_chemo_m + kill_targ_m + kill_T_m)*y[12] 
+        dydt[13] = 0.5*r_A*y[13] - (kill_chemo_c + kill_targ_c + kill_T_c)*y[13] 
+        
+        # Clone B (Resistant to Targeted, Fully Resistant to Chemo to drive progression)
+        dydt[14] = r_B*y[14] - (0.0*kill_chemo_m + 0.0 + kill_T_m)*y[14] 
+        dydt[15] = 0.5*r_B*y[15] - (0.0*kill_chemo_c + 0.0 + kill_T_c)*y[15] 
+        
+        # Clone C (Evolved)
+        dydt[16] = r_C*y[16] - (0.1*kill_chemo_m + kill_targ_m + kill_T_m)*y[16] 
+        dydt[17] = 0.5*r_C*y[17] - (0.1*kill_chemo_c + kill_targ_c + kill_T_c)*y[17] 
+        
+        # --- 3. Immune Dynamics ---
+        death_rate = (kill_chemo_m + kill_targ_m)*y[12] 
+        io_effect = C_io_m / (1 + C_io_m)
+        
+        recruit = 0.005 * death_rate * (1 + 10*io_effect)
+        # IO reduces exhaustion (Checkpoint inhibition)
+        exhaust = 0.02 / (1 + 5*io_effect)
+        
+        dydt[18] = recruit - exhaust*y[18] 
+        dydt[19] = 0.1*dydt[18] 
         
         return dydt
+
 # ==========================================
-# 3. Clinical Trial Engine (Calibrated)
+# 3. Clinical Trial Engine (ODE-Based)
 # ==========================================
-def run_hyper_trial(n_patients=1000): # Reduced N for complexity
+def run_hyper_trial(n_patients=100): 
     gen = PhysiologyGenerator()
     results = []
     
-    print(f"Running Hyper-Realistic Simulation (N={n_patients})...")
+    print(f"Running ODE-Based Simulation (N={n_patients})...")
     
     for i in range(n_patients):
-        if i % 50 == 0: print(f"  Patient {i}...")
+        if i % 10 == 0: print(f"  Patient {i}...")
         cancer = np.random.choice(['NSCLC', 'Pancreatic', 'Melanoma'])
         pt = gen.generate_patient(i, cancer)
         
@@ -151,64 +228,138 @@ def run_hyper_trial(n_patients=1000): # Reduced N for complexity
         rand = np.random.random()
         arm = 'Chemo' if rand < 0.33 else ('Dual' if rand < 0.66 else 'Triple')
         
-        # Simulation (Simplified Logic for Speed/Demo)
-        # We simulate the outcome based on the Spatial/Clonal logic
-        # Instead of full ODE solve for every patient (too slow for 3000 in this env),
-        # we use a stochastic approximation derived from the ODE behavior.
+        # Initialize Model
+        model = SpatialModel(pt)
+        y_curr = model.get_initial_conditions()
         
-        # 1. Penetration Factor
-        pen = 1.0 - pt['stroma'] # 0.1 to 0.9
+        # Simulation Parameters
+        cycle_len = 21 # Days
+        n_cycles = 18 # ~378 days
         
-        # 2. Resistance Factor (Clone B fraction)
-        res_load = pt['clones']['B']
+        # Tracking
+        time_points = []
+        vol_points = []
         
-        # 3. Base PFS (Days) - Calibrated to Benchmarks
-        # Chemo: ~105 days (3.5m)
-        # Dual: ~165 days (5.5m)
-        # Triple: ~270 days (9.0m)
+        baseline = np.sum(y_curr[12:18])
+        nadir = baseline
+        pfs = 365
+        censored = 1
+        best_resp = 0
         
-        if arm == 'Chemo':
-            mu = 105
-            sigma = 40
-        elif arm == 'Dual':
-            # Efficacy depends heavily on Penetration
-            mu = 105 + (100 * pen) # If stroma is dense, no benefit
-            sigma = 50
-        else: # Triple
-            # IO component less affected by stroma (T-cell infiltration modeled differently)
-            # But affected by "Cold" tumors
-            is_hot = 1.0 if cancer == 'Melanoma' else 0.5
-            mu = 105 + (100 * pen) + (150 * is_hot)
-            sigma = 80
+        failed = False
+        
+        for cycle in range(n_cycles):
+            if failed: break
             
-        # Sample PFS
-        pfs = np.random.lognormal(np.log(mu), 0.6)
-        
-        # Best Response
-        # Correlated with PFS
-        resp = -100 * (1 - np.exp(-pfs/300)) # Simple mapping
-        resp += np.random.normal(0, 10) # Noise
-        
-        # Censoring (Trial ends at 365 days)
-        censored = 0
-        if pfs > 365:
-            pfs = 365
-            censored = 1
+            # Apply Doses (Bolus)
+            # Limit Chemo to 6 cycles (0-5)
+            if arm in ['Chemo', 'Triple'] and cycle < 6:
+                y_curr[0] += 50.0 # Add 50 units to Central
+                
+            if arm in ['Triple']:
+                y_curr[8] += 20.0 # Add 20 units to Central
             
+            # Solve for this cycle
+            t_start = cycle * cycle_len
+            t_end = (cycle + 1) * cycle_len
+            t_span = (t_start, t_end)
+            t_eval = np.linspace(t_start, t_end, 22) # Daily
+            
+            sol = solve_ivp(
+                fun=lambda t, y: model.derivatives(t, y, arm),
+                t_span=t_span,
+                y0=y_curr,
+                t_eval=t_eval,
+                method='RK23'
+            )
+            
+            # Update state
+            y_curr = sol.y[:, -1]
+            
+            # Analyze this cycle
+            vol_cycle = np.sum(sol.y[12:18, :], axis=0)
+            
+            for t_idx, vol in enumerate(vol_cycle):
+                day = t_eval[t_idx]
+                
+                if vol < nadir:
+                    nadir = vol
+                
+                pct_change = 100 * (vol - baseline) / baseline
+                if pct_change < best_resp:
+                    best_resp = pct_change
+                
+                # Progression Check
+                # RECIST 1.1: >20% increase from Nadir AND Absolute increase (e.g. 5mm)
+                # We assume Baseline=1.0. Let's require absolute increase of 0.1 (10% of baseline).
+                is_progression = False
+                if vol > 1.2 * nadir and (vol - nadir) > 0.1 * baseline:
+                    is_progression = True
+                
+                if is_progression and day > 20:
+                    pfs = day
+                    censored = 0
+                    failed = True
+                    break
+        
         results.append({
             'id': i, 'arm': arm, 'cancer': cancer,
             'pfs': pfs, 'censored': censored,
-            'best_resp': resp,
+            'best_resp': best_resp,
             'stroma': pt['stroma']
         })
         
     return pd.DataFrame(results)
+
+
+def evaluate_hyper_results(df):
+    """Return simple accuracy diagnostics for the stochastic trial surrogate.
+
+    The function compares arm-level median PFS to the calibration targets used
+    in the simplified clinical trial engine. Differences between the simulated
+    and target medians provide a quick accuracy readout without requiring heavy
+    external validation datasets. Additional distributional diagnostics can be
+    appended here as the model evolves.
+    """
+
+    targets = {
+        'Chemo': 105,
+        'Dual': 165,
+        'Triple': 270,
+    }
+
+    rows = []
+    for arm, target in targets.items():
+        subset = df[df['arm'] == arm]
+        median_pfs = subset['pfs'].median()
+        diff = median_pfs - target
+        rows.append({
+            'arm': arm,
+            'target_median_days': target,
+            'simulated_median_days': median_pfs,
+            'median_error_days': diff,
+            'median_error_pct': 100 * diff / target,
+        })
+
+    summary = pd.DataFrame(rows)
+    summary['patients_per_arm'] = summary['arm'].map(
+        df.groupby('arm').size().to_dict()
+    )
+
+    # Quick distributional sanity checks for reporting
+    summary['pfs_iqr_days'] = summary['arm'].map(
+        df.groupby('arm')['pfs'].quantile(0.75).sub(
+            df.groupby('arm')['pfs'].quantile(0.25)
+        ).to_dict()
+    )
+    return summary[['arm', 'patients_per_arm', 'target_median_days',
+                    'simulated_median_days', 'median_error_days',
+                    'median_error_pct', 'pfs_iqr_days']]
 # ==========================================
 # 4. Visualization
 # ==========================================
 def plot_hyper_results(df):
     # 1. KM Curve
-    from lifelines import KaplanMeierFitter
     plt.figure(figsize=(10, 7))
     kmf = KaplanMeierFitter()
     
@@ -231,9 +382,13 @@ def plot_hyper_results(df):
     plt.xlabel("Stroma Density (Diffusion Barrier)")
     plt.ylabel("Best Tumor Response (%)")
     plt.savefig('figures/fig_spatial_validation.png')
+
 if __name__ == "__main__":
     import os
     os.makedirs('figures', exist_ok=True)
-    df = run_hyper_trial(3000)
+    df = run_hyper_trial(50)
+    eval_summary = evaluate_hyper_results(df)
+    print("\nCalibration diagnostics (simulated vs. target medians):")
+    print(eval_summary.to_string(index=False))
     plot_hyper_results(df)
     print("Hyper-Realistic Simulation Complete.")
